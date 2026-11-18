@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat</title>
+<style>
+  :root{
+    --bg:#eef1ee; --panel:#ffffff; --ink:#1d2a24; --muted:#6b7a72;
+    --mine:#1f6b4f; --mine-ink:#ffffff; --other:#e3e9e5; --line:#d5ddd8; --danger:#c0392b;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#141a17; --panel:#1c2420; --ink:#e6eee9; --muted:#8fa097;
+      --mine:#2e8f69; --other:#2a342f; --line:#2f3a35; }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--ink);display:flex;justify-content:center}
+  .app{width:100%;max-width:720px;height:100%;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line);border-right:1px solid var(--line)}
+  header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line)}
+  header h1{font-size:18px;margin:0}
+  header small{color:var(--muted);display:block;font-size:12px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#aaa;margin-right:6px}
+  .dot.on{background:#2fb36d}
+  button{font:inherit;cursor:pointer;border:0;border-radius:8px;padding:8px 14px}
+  button:disabled{opacity:.5;cursor:default}
+  .btn{background:var(--mine);color:var(--mine-ink)}
+  .btn.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  .btn.admin-on{background:var(--danger);color:#fff}
+  #list{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px}
+  .msg{max-width:85%;padding:8px 12px;border-radius:14px;background:var(--other);align-self:flex-start;overflow-wrap:anywhere}
+  .msg .meta{font-size:12px;opacity:.75;margin-bottom:2px}
+  .msg .row{display:flex;gap:8px;align-items:flex-start}
+  .msg .del{background:var(--danger);color:#fff;padding:2px 8px;font-size:12px;border-radius:6px;flex-shrink:0}
+  .msg .pdf{display:block;margin-top:6px;background:var(--mine);color:var(--mine-ink);padding:6px 10px;font-size:14px}
+  .empty{margin:auto;color:var(--muted);text-align:center}
+  #form{display:none;flex-direction:column;gap:8px;padding:12px;border-top:1px solid var(--line)}
+  #form.show{display:flex}
+  #form .r{display:flex;gap:8px}
+  input[type=text]{flex:1;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);min-width:0}
+  input[type=file]{font:inherit;color:var(--ink);min-width:0;max-width:100%}
+  #err{color:var(--danger);font-size:13px;min-height:1em}
+  .note{padding:10px 16px;border-top:1px solid var(--line);color:var(--muted);font-size:13px;text-align:center}
+  :focus-visible{outline:2px solid var(--mine);outline-offset:2px}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div><h1>Chat</h1><small><span id="dot" class="dot"></span><span id="status">Ulanmoqda…</span></small></div>
+    <button id="adminBtn" class="btn ghost" type="button">Admin panel</button>
+  </header>
+  <div id="list" aria-live="polite"></div>
+  <form id="form" autocomplete="off">
+    <div class="r">
+      <input id="text" type="text" placeholder="Xabar yozing…" maxlength="500">
+      <button id="sendBtn" class="btn" type="submit">Yuborish</button>
+    </div>
+    <input id="pdf" type="file" accept="application/pdf,.pdf">
+    <div id="err"></div>
+  </form>
+  <div id="note" class="note">Bu chatda faqat admin yoza oladi.</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
+<script>
+/* ===== SOZLAMALAR ===== */
+const ADMIN_PASSWORD = "gold9999";
+// Noyob nom bering (boshqalar topib olmasligi uchun tasodifiy harflar qo'shing).
+const ROOM = "yulduz-admin-chat-q7k2x9";
+const BROKER = "wss://broker.hivemq.com:8884/mqtt";
+const MAX_PDF = 2 * 1024 * 1024;   // 2 MB
+/* ====================== */
+
+const $ = id => document.getElementById(id);
+const listEl = $("list"), statusEl = $("status"), dotEl = $("dot"), adminBtn = $("adminBtn");
+const BASE = "chat/" + ROOM;
+const T_MSG = BASE + "/m/", T_FILE = BASE + "/f/", T_PING = BASE + "/p";
+
+const uid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+let isAdmin = false, connected = false;
+const msgs = {};          // id -> {id,text,time,file?}
+const peers = {};         // uid -> oxirgi ko'ringan vaqt
+const waiters = {};       // id -> PDF kutayotgan funksiya
+
+function render() {
+  const ids = Object.keys(msgs).sort((a,b)=>msgs[a].time-msgs[b].time);
+  const near = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 80;
+  listEl.innerHTML = "";
+  if (!ids.length) {
+    const e = document.createElement("div"); e.className = "empty";
+    e.textContent = "Hozircha xabar yo'q."; listEl.appendChild(e); return;
+  }
+  for (const id of ids) {
+    const m = msgs[id];
+    const el = document.createElement("div"); el.className = "msg";
+    const meta = document.createElement("div"); meta.className = "meta";
+    meta.textContent = "Admin · " + new Date(m.time).toLocaleString([], {day:"2-digit", month:"2-digit", hour:"2-digit", minute:"2-digit"});
+    const row = document.createElement("div"); row.className = "row";
+    const t = document.createElement("div"); t.textContent = m.text || ""; row.appendChild(t);
+    if (isAdmin) {
+      const d = document.createElement("button"); d.className = "del"; d.type = "button"; d.textContent = "O'chirish";
+      d.onclick = () => removeMsg(id);
+      row.appendChild(d);
+    }
+    el.append(meta, row);
+    if (m.file) {
+      const b = document.createElement("button"); b.className = "pdf"; b.type = "button";
+      b.textContent = "📄 " + m.file.name + " (" + Math.max(1, Math.round(m.file.size / 1024)) + " KB)";
+      b.onclick = () => openPdf(m, b);
+      el.appendChild(b);
+    }
+    listEl.appendChild(el);
+  }
+  if (near) listEl.scrollTop = listEl.scrollHeight;
+}
+
+function updateStatus() {
+  const now = Date.now();
+  const online = Object.values(peers).filter(t => now - t < 25000).length + 1;
+  dotEl.classList.toggle("on", connected);
+  statusEl.textContent = connected ? "Onlayn: " + online : "Ulanmoqda…";
+}
+
+/* ---------- Tarmoq (MQTT, retained xabarlar bilan) ---------- */
+const client = mqtt.connect(BROKER, { clientId: "c_" + uid.slice(0,10) + Math.random().toString(16).slice(2,6), reconnectPeriod: 2000 });
+
+function pub(topic, payload, retain) {
+  return new Promise((res, rej) => client.publish(topic, payload, { qos: 1, retain: !!retain }, e => e ? rej(e) : res()));
+}
+
+client.on("connect", () => {
+  connected = true; updateStatus();
+  client.subscribe([T_MSG + "#", T_PING]);
+  client.publish(T_PING, JSON.stringify({ uid }));
+});
+client.on("close", () => { connected = false; updateStatus(); });
+
+client.on("message", (topic, payload) => {
+  if (topic === T_PING) {
+    try { const d = JSON.parse(payload.toString()); if (d.uid && d.uid !== uid) peers[d.uid] = Date.now(); } catch {}
+    updateStatus(); return;
+  }
+  if (topic.startsWith(T_MSG)) {
+    const id = topic.slice(T_MSG.length);
+    if (!payload.length) { delete msgs[id]; render(); return; }   // o'chirilgan
+    let d; try { d = JSON.parse(payload.toString()); } catch { return; }
+    if (!d || typeof d !== "object") return;
+    const m = { id, text: String(d.text || "").slice(0, 500), time: +d.time || Date.now() };
+    if (d.file && typeof d.file.name === "string") m.file = { name: d.file.name.slice(0, 100), size: +d.file.size || 0 };
+    msgs[id] = m; render();
+    return;
+  }
+  if (topic.startsWith(T_FILE)) {
+    const id = topic.slice(T_FILE.length);
+    if (waiters[id] && payload.length) waiters[id](payload.toString());
+  }
+});
+
+setInterval(() => { if (client.connected) client.publish(T_PING, JSON.stringify({ uid })); updateStatus(); }, 10000);
+
+/* ---------- PDF ochish (faqat bosilganda yuklanadi) ---------- */
+function openPdf(m, btn) {
+  const id = m.id, old = btn.textContent;
+  btn.disabled = true; btn.textContent = "Yuklanmoqda…";
+  const done = () => { delete waiters[id]; client.unsubscribe(T_FILE + id); btn.disabled = false; btn.textContent = old; };
+  const timer = setTimeout(() => { done(); alert("PDF topilmadi yoki yuklanmadi."); }, 15000);
+  waiters[id] = b64 => {
+    clearTimeout(timer);
+    try {
+      const bin = atob(b64), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+      const a = document.createElement("a"); a.href = url; a.target = "_blank"; a.rel = "noopener"; a.download = m.file.name;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch { alert("PDF ochib bo'lmadi."); }
+    done();
+  };
+  client.subscribe(T_FILE + id);
+}
+
+/* ---------- Faqat admin: yuborish va o'chirish ---------- */
+function b64file(f) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(String(r.result).split(",")[1]);
+    r.onerror = () => rej(new Error("Faylni o'qib bo'lmadi"));
+    r.readAsDataURL(f);
+  });
+}
+
+$("form").addEventListener("submit", async e => {
+  e.preventDefault();
+  if (!isAdmin) return;
+  const err = $("err"), btn = $("sendBtn");
+  err.textContent = "";
+  const text = $("text").value.trim().slice(0, 500), f = $("pdf").files[0];
+  if (!text && !f) { err.textContent = "Xabar yoki PDF kiriting."; return; }
+  if (!client.connected) { err.textContent = "Hali ulanmagan. Biroz kuting."; return; }
+  if (f && f.type !== "application/pdf" && !/\.pdf$/i.test(f.name)) { err.textContent = "Faqat PDF fayl."; return; }
+  if (f && f.size > MAX_PDF) { err.textContent = "PDF 2 MB dan katta bo'lmasin."; return; }
+  btn.disabled = true;
+  try {
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+    const m = { text, time: Date.now() };
+    if (f) { await pub(T_FILE + id, await b64file(f), true); m.file = { name: f.name, size: f.size }; }
+    await pub(T_MSG + id, JSON.stringify(m), true);
+    $("text").value = ""; $("pdf").value = "";
+    listEl.scrollTop = listEl.scrollHeight;
+  } catch (x) { err.textContent = "Yuborib bo'lmadi: " + (x.message || x); }
+  btn.disabled = false;
+});
+
+function removeMsg(id) {
+  if (!confirm("O'chirilsinmi?")) return;
+  pub(T_MSG + id, "", true).catch(() => {});
+  pub(T_FILE + id, "", true).catch(() => {});
+}
+
+/* ---------- Admin panel ---------- */
+adminBtn.addEventListener("click", () => {
+  if (isAdmin) {
+    isAdmin = false; adminBtn.textContent = "Admin panel"; adminBtn.className = "btn ghost";
+    $("form").classList.remove("show"); $("note").style.display = ""; render(); return;
+  }
+  const p = prompt("Admin parolini kiriting:");
+  if (p === null) return;
+  if (p === ADMIN_PASSWORD) {
+    isAdmin = true; adminBtn.textContent = "Admindan chiqish"; adminBtn.className = "btn admin-on";
+    $("form").classList.add("show"); $("note").style.display = "none"; render();
+  } else alert("Parol noto'g'ri.");
+});
+
+render();
+</script>
+</body>
+</html>
